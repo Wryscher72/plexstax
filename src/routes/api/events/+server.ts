@@ -1,75 +1,50 @@
 // src/routes/api/events/+server.ts
-import type { RequestHandler } from './$types';
-import { getSonarrSummary, getSonarrQueueRibbons } from '$lib/server/sonarr';
+import type { RequestHandler } from '@sveltejs/kit';
+import { gatherCards } from '$lib/server/services';
 
-export const GET: RequestHandler = ({ request }) => {
-  let closed = false;
-  const timers: ReturnType<typeof setInterval>[] = [];
+export const GET: RequestHandler = async () => {
+  const stream = new ReadableStream({
+    async start(controller) {
+      const enc = (obj: any) => controller.enqueue(`data: ${JSON.stringify(obj)}\n\n`);
+      const ping = () => controller.enqueue(`:hb ${Date.now()}\n\n`);
 
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const enc = new TextEncoder();
-      const send = (obj: unknown) => {
-        if (closed) return;
+      // hello
+      enc({ kind: 'hello' });
+
+      // first payload fast
+      try {
+        const data = await gatherCards();
+        enc({ kind: 'cards', data });
+      } catch {
+        // ignore—UI will update on next tick
+      }
+
+      // steady updates
+      const t = setInterval(async () => {
         try {
-          controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+          const data = await gatherCards();
+          enc({ kind: 'cards', data });
         } catch {
-          /* controller already closed */
+          // swallow; next tick will try again
         }
-      };
+        ping();
+      }, 5000);
 
-      const cleanup = () => {
-        if (closed) return;
-        closed = true;
-        for (const t of timers) clearInterval(t);
-        try {
-          controller.close();
-        } catch {/* ignore */}
-      };
-
-      // Close once when the client disconnects
-      request.signal.addEventListener('abort', cleanup, { once: true });
-
-      // Initial hello so the UI knows we're live
-      send({ kind: 'hello' });
-
-      // SONARR cards every 10s (if env vars present)
-      timers.push(
-        setInterval(async () => {
-          try {
-            const sonarr = await getSonarrSummary();
-            send({ kind: 'cards', data: { sonarr } });
-          } catch {/* keep stream alive */}
-        }, 10_000)
-      );
-
-      // SONARR ribbons every 3s
-      timers.push(
-        setInterval(async () => {
-          try {
-            const ribbons = await getSonarrQueueRibbons();
-            for (const r of ribbons.slice(0, 10)) send({ kind: 'ribbon', data: r });
-          } catch {}
-        }, 3_000)
-      );
-
-      // Heartbeat (helps with proxies)
-      timers.push(
-        setInterval(() => {
-          if (closed) return;
-          try {
-            controller.enqueue(enc.encode(`:hb ${Date.now()}\n\n`));
-          } catch {}
-        }, 15_000)
-      );
+      // cleanup on client disconnect
+      // @ts-ignore - globalThis is fine in node
+      const signal = (globalThis as any).request?.signal as AbortSignal | undefined;
+      signal?.addEventListener('abort', () => {
+        clearInterval(t);
+        try { controller.close(); } catch {}
+      });
     }
   });
 
   return new Response(stream, {
     headers: {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive'
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
     }
   });
 };
