@@ -1,6 +1,6 @@
 /* src/lib/server/services.ts
    Card data fetchers for PlexStax (Sonarr, Radarr, SABnzbd, NZBGet, Overseerr, Tautulli).
-   - Uses a configurable timeout (HTTP_TIMEOUT_MS, default 25s)
+   - Uses a configurable timeout (HTTP_TIMEOUT_MS, default 4s per MVP plan)
    - Uses lighter endpoints / pagination to get counts quickly
    - Never throws: each card returns { state, data?, message? }
 */
@@ -8,9 +8,9 @@
 type State = 'ok' | 'not_configured' | 'error';
 type Card<T> = { state: State; data?: T; message?: string };
 
-const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 25000); // 25s default
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 4000); // 4s default
 
-// ---- env helpers (tolerate common misspellings) ----
+// ---- env helpers ----
 function envOne(...names: string[]) {
   for (const n of names) {
     const v = process.env[n];
@@ -40,8 +40,10 @@ function normalizeUrl(u: string): string {
   if (!u) return '';
   // allow "host:port"
   if (/^[^:/]+\:\d+$/.test(u)) return `http://${u}`;
-  // fix common typos http//host or http///host
-  u = u.replace(/^http\/\/\//i, 'http://').replace(/^http\/\//i, 'http://');
+  // fix common http/https typos: http///, http//, https///, https//
+  u = u
+    .replace(/^https?:\/\/\//i, (m) => m.startsWith('https') ? 'https://' : 'http://')
+    .replace(/^https?:\/\//i, (m) => m); // leave proper schemes as-is
   if (!/^https?:\/\//i.test(u)) u = `http://${u}`;
   return u.replace(/\/+$/,''); // trim trailing slash
 }
@@ -80,14 +82,13 @@ export async function sonarrCard(): Promise<Card<{ queued: number; wanted: numbe
 
   try {
     // quick liveness check
-    await fetchJson(`${base}/api/v3/system/status`, { headers }, 8000);
+    await fetchJson(`${base}/api/v3/system/status`, { headers }, 2000);
 
     // use pagination to get counts quickly
     const [queue, wanted, series] = await Promise.all([
-      fetchJson<any>(`${base}/api/v3/queue?page=1&pageSize=1`, { headers }, 12000),
-      fetchJson<any>(`${base}/api/v3/wanted/missing?page=1&pageSize=1`, { headers }, 12000),
-      // series list can be heavy; some builds support totalRecords via paging
-      fetchJson<any>(`${base}/api/v3/series?page=1&pageSize=1&includeStatistics=false`, { headers }, 15000)
+      fetchJson<any>(`${base}/api/v3/queue?page=1&pageSize=1`, { headers }),
+      fetchJson<any>(`${base}/api/v3/wanted/missing?page=1&pageSize=1`, { headers }),
+      fetchJson<any>(`${base}/api/v3/series?page=1&pageSize=1&includeStatistics=false`, { headers })
     ]);
 
     const queued = typeof queue?.totalRecords === 'number'
@@ -120,23 +121,22 @@ export async function radarrCard(): Promise<Card<{ queued: number; movies: numbe
   const headers = { 'X-Api-Key': key };
 
   try {
-    await fetchJson(`${base}/api/v3/system/status`, { headers }, 8000);
+    await fetchJson(`${base}/api/v3/system/status`, { headers }, 2000);
 
     const [queue] = await Promise.all([
-      fetchJson<any>(`${base}/api/v3/queue?page=1&pageSize=1`, { headers }, 12000)
+      fetchJson<any>(`${base}/api/v3/queue?page=1&pageSize=1`, { headers })
     ]);
 
-    // movie count: try paged trick first (if unsupported, fall back to full list with larger timeout)
+    // movie count: try paged trick first (if unsupported, fall back to full list)
     let moviesCount = 0;
     try {
-      const moviesPaged = await fetchJson<any>(`${base}/api/v3/movie?page=1&pageSize=1`, { headers }, 12000);
+      const moviesPaged = await fetchJson<any>(`${base}/api/v3/movie?page=1&pageSize=1`, { headers });
       if (typeof moviesPaged?.totalRecords === 'number') moviesCount = moviesPaged.totalRecords;
     } catch { /* ignore */ }
 
     if (moviesCount === 0) {
-      // fallback (heavier)
-      const all = await fetchJson<any[]>(`${base}/api/v3/movie`, { headers }, HTTP_TIMEOUT_MS);
-      moviesCount = Array.isArray(all) ? all.length : Number(all?.length ?? 0);
+      const all = await fetchJson<any[]>(`${base}/api/v3/movie`, { headers });
+      moviesCount = Array.isArray(all) ? all.length : Number((all as any)?.length ?? 0);
     }
 
     const queued = typeof queue?.totalRecords === 'number'
@@ -157,7 +157,7 @@ export async function sabCard(): Promise<Card<{ queue: number; rateDownBps: numb
   if (!base || !key) return notConfigured('Set SABNZBD_URL and SABNZBD_API_KEY');
 
   try {
-    const q = await fetchJson<any>(`${base}/api?mode=queue&output=json&apikey=${encodeURIComponent(key)}`, {}, 10000);
+    const q = await fetchJson<any>(`${base}/api?mode=queue&output=json&apikey=${encodeURIComponent(key)}`);
     const queueCount = Number(q?.queue?.noofslots ?? (Array.isArray(q?.queue?.slots) ? q.queue.slots.length : 0));
     const rateDown = Number(q?.queue?.kbpersec ? q.queue.kbpersec * 1024 : 0);
     return ok({ queue: queueCount, rateDownBps: rateDown, link: base });
@@ -179,14 +179,11 @@ export async function nzbgetCard(): Promise<Card<{ queue: number; rateDownBps: n
     if (ENV.NZBGET_USER || ENV.NZBGET_PASS) {
       headers['Authorization'] = 'Basic ' + Buffer.from(`${ENV.NZBGET_USER}:${ENV.NZBGET_PASS}`).toString('base64');
     }
-    const res = await fetch(base, {
+    const data = await fetchJson<any>(base, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ method: 'status', params: [], id: 1 }),
-      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
+      body: JSON.stringify({ method: 'status', params: [], id: 1 })
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data: any = await res.json();
     const s = data?.result || {};
     const queue = Number(s?.QueuedCount ?? 0);
     const rateDownBps = Number(s?.DownloadRate ?? 0);
@@ -208,17 +205,16 @@ export async function overseerrCard(): Promise<Card<{ pending: number; available
     // /status often includes request stats; if not, fall back to filtered calls
     let pending = 0, available = 0;
     try {
-      const st = await fetchJson<any>(`${base}/api/v1/status`, { headers }, 10000);
+      const st = await fetchJson<any>(`${base}/api/v1/status`, { headers });
       pending = Number(st?.requests?.pending ?? 0);
       available = Number(st?.requests?.available ?? 0);
     } catch {
-      // Fallback by filter (cheap: take=1 just to get totals)
       try {
-        const p = await fetchJson<any>(`${base}/api/v1/request?take=1&skip=0&filter=pending`, { headers }, 10000);
+        const p = await fetchJson<any>(`${base}/api/v1/request?take=1&skip=0&filter=pending`, { headers });
         pending = Number(p?.pageInfo?.results ?? p?.total ?? 0);
       } catch {}
       try {
-        const a = await fetchJson<any>(`${base}/api/v1/request?take=1&skip=0&filter=available`, { headers }, 10000);
+        const a = await fetchJson<any>(`${base}/api/v1/request?take=1&skip=0&filter=available`, { headers });
         available = Number(a?.pageInfo?.results ?? a?.total ?? 0);
       } catch {}
     }
@@ -236,7 +232,7 @@ export async function tautulliCard(): Promise<Card<{ total: number; sessions: Ar
   if (!base || !key) return notConfigured('Set TAUTULLI_URL and TAUTULLI_API_KEY');
 
   try {
-    const d = await fetchJson<any>(`${base}/api/v2?apikey=${encodeURIComponent(key)}&cmd=get_activity`, {}, 12000);
+    const d = await fetchJson<any>(`${base}/api/v2?apikey=${encodeURIComponent(key)}&cmd=get_activity`);
     const sess = Array.isArray(d?.response?.data?.sessions) ? d.response.data.sessions : [];
     const mapped = sess.slice(0, 5).map((s: any) => ({
       user: String(s?.friendly_name || s?.username || 'User'),
