@@ -1,6 +1,9 @@
 <script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
+
   type State = 'ok' | 'not_configured' | 'error';
   type Card<T> = { state: State } & (T extends object ? { data?: T; message?: string } : any);
+
   let cards: any = {};
 
   function fmtRate(bps: number) {
@@ -11,17 +14,23 @@
     return `${n.toFixed(1)} ${units[i]}`;
   }
 
-  const es = new EventSource('/api/events');
-  es.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.kind === 'cards') {
-        cards = msg.data;
-      }
-    } catch {}
-  };
+  let es: EventSource | null = null;
 
-  $: theme = (import.meta.env.VITE_THEME || 'dark');
+  // IMPORTANT: only create EventSource in the browser
+  onMount(() => {
+    es = new EventSource('/api/events');
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.kind === 'cards') cards = msg.data;
+      } catch {}
+    };
+  });
+
+  onDestroy(() => {
+    es?.close();
+    es = null;
+  });
 </script>
 
 <style>
