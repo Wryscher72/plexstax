@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import Card from '$lib/components/Card.svelte';
   import SonarrIcon from '$lib/icons/SonarrIcon.svelte';
   import RadarrIcon from '$lib/icons/RadarrIcon.svelte';
   import SabIcon from '$lib/icons/SabIcon.svelte';
@@ -13,8 +14,8 @@
     | { state: 'not_configured'; message: string };
 
   type CardsPayload = {
-    sonarr:   CardState<{ queued:number; wanted:number; series:number }>;
-    radarr:   CardState<{ queued:number; movies:number }>;
+    sonarr:   CardState<{ queued:number; wanted:number; series:number; link:string }>;
+    radarr:   CardState<{ queued:number; movies:number; link:string }>;
     sab:      CardState<{ queue:number; rateDownBps:number; link:string }>;
     nzbget:   CardState<{ queue:number; rateDownBps:number; link:string }>;
     overseerr:CardState<{ pending:number; available:number; link:string }>;
@@ -23,11 +24,6 @@
 
   let cards: CardsPayload | null = null;
 
-  function openLink(link?: string){
-    if (!link) return;
-    window.open(link, '_blank', 'noopener,noreferrer');
-  }
-
   function fmtBps(n: number){
     if (!n || n <= 0) return '0 B/s';
     const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
@@ -35,10 +31,9 @@
     while (v >= 1024 && i < units.length-1){ v /= 1024; i++; }
     return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
   }
-
   function ratePercentFromBps(n: number){
     const cap = 100 * 1024 * 1024; // 100 MB/s visual cap
-    const pct = Math.max(0, Math.min(1, n / cap));
+    const pct = Math.max(0, Math.min(1, (n||0) / cap));
     return Math.round(pct * 100);
   }
 
@@ -48,147 +43,104 @@
       try {
         const obj = JSON.parse(e.data);
         if (obj?.kind === 'cards') cards = obj.data as CardsPayload;
-      } catch { /* ignore */ }
+      } catch {}
     };
     return () => es.close();
   });
+
+  const cardsConfig = [
+    {
+      id: 'sonarr', title: 'Sonarr', icon: SonarrIcon, iconClass: 'sonarr', badgeClass: 'badge-sonarr',
+      getState: () => cards?.sonarr?.state,
+      getMessage: () => (cards?.sonarr as any)?.message,
+      getLink: () => (cards?.sonarr?.state === 'ok') ? (cards?.sonarr as any)?.data?.link : undefined,
+      kvs: () => cards?.sonarr?.state === 'ok' ? [
+        { label:'Queued', value: (cards!.sonarr as any).data.queued },
+        { label:'Wanted', value: (cards!.sonarr as any).data.wanted },
+        { label:'Series', value: (cards!.sonarr as any).data.series }
+      ] : []
+    },
+    {
+      id: 'radarr', title: 'Radarr', icon: RadarrIcon, iconClass: 'radarr', badgeClass: 'badge-radarr',
+      getState: () => cards?.radarr?.state,
+      getMessage: () => (cards?.radarr as any)?.message,
+      getLink: () => (cards?.radarr?.state === 'ok') ? (cards?.radarr as any)?.data?.link : undefined,
+      kvs: () => cards?.radarr?.state === 'ok' ? [
+        { label:'Queued', value: (cards!.radarr as any).data.queued },
+        { label:'Movies', value: (cards!.radarr as any).data.movies }
+      ] : []
+    },
+    {
+      id: 'sab', title: 'SABnzbd', icon: SabIcon, iconClass: 'sab', badgeClass: 'badge-sab',
+      getState: () => cards?.sab?.state,
+      getMessage: () => (cards?.sab as any)?.message,
+      getLink: () => (cards?.sab?.state === 'ok') ? (cards?.sab as any)?.data?.link : undefined,
+      kvs: () => cards?.sab?.state === 'ok' ? [
+        { label:'Queue', value: (cards!.sab as any).data.queue },
+        { label:'Down', value: fmtBps((cards!.sab as any).data.rateDownBps) }
+      ] : [],
+      meter: () => cards?.sab?.state === 'ok' ? ratePercentFromBps((cards!.sab as any).data.rateDownBps) : undefined,
+      meterColor: 'var(--sab)'
+    },
+    {
+      id: 'nzbget', title: 'NZBGet', icon: NzbgetIcon, iconClass: 'nzb', badgeClass: 'badge-nzb',
+      getState: () => cards?.nzbget?.state,
+      getMessage: () => (cards?.nzbget as any)?.message,
+      getLink: () => (cards?.nzbget?.state === 'ok') ? (cards?.nzbget as any)?.data?.link : undefined,
+      kvs: () => cards?.nzbget?.state === 'ok' ? [
+        { label:'Queue', value: (cards!.nzbget as any).data.queue },
+        { label:'Down', value: fmtBps((cards!.nzbget as any).data.rateDownBps) }
+      ] : [],
+      meter: () => cards?.nzbget?.state === 'ok' ? ratePercentFromBps((cards!.nzbget as any).data.rateDownBps) : undefined,
+      meterColor: 'var(--nzb)'
+    },
+    {
+      id: 'overseerr', title: 'Overseerr', icon: OverseerrIcon, iconClass: 'over', badgeClass: 'badge-over',
+      getState: () => cards?.overseerr?.state,
+      getMessage: () => (cards?.overseerr as any)?.message,
+      getLink: () => (cards?.overseerr?.state === 'ok') ? (cards?.overseerr as any)?.data?.link : undefined,
+      kvs: () => cards?.overseerr?.state === 'ok' ? [
+        { label:'Pending', value: (cards!.overseerr as any).data.pending },
+        { label:'Available', value: (cards!.overseerr as any).data.available }
+      ] : []
+    },
+    {
+      id: 'tautulli', title: 'Plex (via Tautulli)', icon: TautulliIcon, iconClass: 'taut', badgeClass: 'badge-taut',
+      getState: () => cards?.tautulli?.state,
+      getMessage: () => (cards?.tautulli as any)?.message,
+      getLink: () => (cards?.tautulli?.state === 'ok') ? (cards?.tautulli as any)?.data?.link : undefined,
+      kvs: () => cards?.tautulli?.state === 'ok' ? [
+        { label:'Streams', value: (cards!.tautulli as any).data.total }
+      ] : []
+    }
+  ] as const;
 </script>
 
 <h1>PlexStax</h1>
 
 <div class="grid">
-  <!-- Sonarr -->
-  <div class="card" style="grid-column: span 4;">
-    <div class="header">
-      <SonarrIcon class="ico sonarr"/>
-      <span class="badge badge-sonarr">Sonarr</span>
-      <div class="title">Sonarr</div>
-    </div>
-    {#if cards?.sonarr?.state === 'ok'}
-      <div class="kvs">
-        <div class="label">Queued</div><div class="value">{cards.sonarr.data.queued}</div>
-        <div class="label">Wanted</div><div class="value">{cards.sonarr.data.wanted}</div>
-        <div class="label">Series</div><div class="value">{cards.sonarr.data.series}</div>
-      </div>
-    {:else if cards?.sonarr?.state === 'not_configured'}
-      <div class="error">{cards.sonarr.message}</div>
-    {:else if cards?.sonarr?.state === 'error'}
-      <div class="error">{cards.sonarr.message}</div>
-    {/if}
-  </div>
-
-  <!-- Radarr -->
-  <div class="card" style="grid-column: span 4;">
-    <div class="header">
-      <RadarrIcon class="ico radarr"/>
-      <span class="badge badge-radarr">Radarr</span>
-      <div class="title">Radarr</div>
-    </div>
-    {#if cards?.radarr?.state === 'ok'}
-      <div class="kvs">
-        <div class="label">Queued</div><div class="value">{cards.radarr.data.queued}</div>
-        <div class="label">Movies</div><div class="value">{cards.radarr.data.movies}</div>
-      </div>
-    {:else if cards?.radarr?.state === 'not_configured'}
-      <div class="error">{cards.radarr.message}</div>
-    {:else if cards?.radarr?.state === 'error'}
-      <div class="error">{cards.radarr.message}</div>
-    {/if}
-  </div>
-
-  <!-- SABnzbd -->
-  <div class="card click" style="grid-column: span 4;" on:click={() => openLink(cards?.sab?.state==='ok' ? cards?.sab?.data?.link : undefined)}>
-    <div class="header">
-      <SabIcon class="ico sab"/>
-      <span class="badge badge-sab">SABnzbd</span>
-      <div class="title">SABnzbd</div>
-    </div>
-    {#if cards?.sab?.state === 'ok'}
-      <div class="kvs">
-        <div class="label">Queue</div><div class="value">{cards.sab.data.queue}</div>
-        <div class="label">Down</div><div class="value">{fmtBps(cards.sab.data.rateDownBps)}</div>
-      </div>
-      <div class="meter" aria-hidden="true">
-        <div class="fill" style="background:var(--sab); width:{ratePercentFromBps(cards.sab.data.rateDownBps)}%"></div>
-      </div>
-    {:else if cards?.sab?.state === 'not_configured'}
-      <div class="error">{cards.sab.message}</div>
-    {:else if cards?.sab?.state === 'error'}
-      <div class="error">{cards.sab.message}</div>
-    {/if}
-  </div>
-
-  <!-- NZBGet -->
-  <div class="card click" style="grid-column: span 4;" on:click={() => openLink(cards?.nzbget?.state==='ok' ? cards?.nzbget?.data?.link : undefined)}>
-    <div class="header">
-      <NzbgetIcon class="ico nzb"/>
-      <span class="badge badge-nzb">NZBGet</span>
-      <div class="title">NZBGet</div>
-    </div>
-    {#if cards?.nzbget?.state === 'ok'}
-      <div class="kvs">
-        <div class="label">Queue</div><div class="value">{cards.nzbget.data.queue}</div>
-        <div class="label">Down</div><div class="value">{fmtBps(cards.nzbget.data.rateDownBps)}</div>
-      </div>
-      <div class="meter" aria-hidden="true">
-        <div class="fill" style="background:var(--nzb); width:{ratePercentFromBps(cards.nzbget.data.rateDownBps)}%"></div>
-      </div>
-    {:else if cards?.nzbget?.state === 'not_configured'}
-      <div class="error">{cards.nzbget.message}</div>
-    {:else if cards?.nzbget?.state === 'error'}
-      <div class="error">{cards.nzbget.message}</div>
-    {/if}
-  </div>
-
-  <!-- Overseerr -->
-  <div class="card click" style="grid-column: span 4;" on:click={() => openLink(cards?.overseerr?.state==='ok' ? cards?.overseerr?.data?.link : undefined)}>
-    <div class="header">
-      <OverseerrIcon class="ico over"/>
-      <span class="badge badge-over">Overseerr</span>
-      <div class="title">Overseerr</div>
-    </div>
-    {#if cards?.overseerr?.state === 'ok'}
-      <div class="kvs">
-        <div class="label">Pending</div><div class="value">{cards.overseerr.data.pending}</div>
-        <div class="label">Available</div><div class="value">{cards.overseerr.data.available}</div>
-      </div>
-    {:else if cards?.overseerr?.state === 'not_configured'}
-      <div class="error">{cards.overseerr.message}</div>
-    {:else if cards?.overseerr?.state === 'error'}
-      <div class="error">{cards.overseerr.message}</div>
-    {/if}
-  </div>
-
-  <!-- Tautulli -->
-  <div class="card click" style="grid-column: span 4;" on:click={() => openLink(cards?.tautulli?.state==='ok' ? cards?.tautulli?.data?.link : undefined)}>
-    <div class="header">
-      <TautulliIcon class="ico taut"/>
-      <span class="badge badge-taut">Tautulli</span>
-      <div class="title">Plex (via Tautulli)</div>
-    </div>
-    {#if cards?.tautulli?.state === 'ok'}
-      <div class="kvs">
-        <div class="label">Streams</div><div class="value">{cards.tautulli.data.total}</div>
-      </div>
-    {:else if cards?.tautulli?.state === 'not_configured'}
-      <div class="error">{cards.tautulli.message}</div>
-    {:else if cards?.tautulli?.state === 'error'}
-      <div class="error">{cards.tautulli.message}</div>
-    {/if}
-  </div>
+  {#each cardsConfig as c}
+    <Card
+      style="grid-column: span 4;"
+      title={c.title}
+      icon={c.icon}
+      iconClass={c.iconClass}
+      badgeClass={c.badgeClass}
+      state={(c.getState() as any) ?? 'not_configured'}
+      message={(c.getMessage() as any) ?? ''}
+      link={c.getLink()}
+      kvs={c.kvs()}
+      meterPct={typeof (c as any).meter === 'function' ? (c as any).meter() : undefined}
+      meterColor={(c as any).meterColor}
+    />
+  {/each}
 </div>
 
 <p class="note">Live updates every 5s. Cards are clickable.</p>
 
 <style>
-  .header{ display:flex; align-items:center; gap:8px; margin:2px 0 10px; }
-  .title{ font-size:14px; font-weight:700; letter-spacing:.3px; }
-
-  .ico{ width:18px; height:18px; }
-  .ico.sonarr{ color:var(--sonarr); }
-  .ico.radarr{ color:var(--radarr); }
-  .ico.sab{    color:var(--sab); }
-  .ico.nzb{    color:var(--nzb); }
-  .ico.over{   color:var(--over); }
-  .ico.taut{   color:var(--taut); }
+  .grid{ display:grid; grid-template-columns: repeat(12, 1fr); gap:14px; }
+  @media (max-width: 900px){ .grid{ grid-template-columns: repeat(6, 1fr); } }
+  @media (max-width: 640px){ .grid{ grid-template-columns: repeat(2, 1fr); } }
+  .note{ margin-top:16px; color:var(--muted); border-top:1px solid var(--edge); padding-top:10px; }
 </style>
