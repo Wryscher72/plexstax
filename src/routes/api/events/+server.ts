@@ -1,42 +1,43 @@
 import type { RequestHandler } from '@sveltejs/kit';
 import { gatherCards } from '$lib/server/services';
 
+const INTERVAL_DEFAULT = Number(process.env.POLL_INTERVAL_MS || 5000);
+
 export const GET: RequestHandler = ({ request }) => {
   const te = new TextEncoder();
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopped = false;
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const send = (obj: any) => controller.enqueue(te.encode(`data: ${JSON.stringify(obj)}\n\n`));
       const ping = () => controller.enqueue(te.encode(`:hb ${Date.now()}\n\n`));
 
-      // greet immediately
       send({ kind: 'hello' });
 
-      // one polling tick; DO NOT await this in start()
-      const tick = async () => {
+      const loop = async () => {
+        if (stopped) return;
         try {
           const data = await gatherCards();
           send({ kind: 'cards', data });
         } catch (e) {
-          // keep the stream alive even if one tick fails
           send({ kind: 'error', message: e instanceof Error ? e.message : String(e) });
         }
         ping();
+        if (!stopped) timer = setTimeout(loop, INTERVAL_DEFAULT);
       };
 
-      // fire-and-forget first tick, then interval
-      setTimeout(() => { void tick(); }, 0);
-      timer = setInterval(() => { void tick(); }, 5000);
+      void loop();
 
-      // cleanup on disconnect
       request.signal.addEventListener('abort', () => {
-        if (timer) { clearInterval(timer); timer = null; }
+        stopped = true;
+        if (timer) { clearTimeout(timer); timer = null; }
         try { controller.close(); } catch {}
       });
     },
     cancel() {
-      if (timer) { clearInterval(timer); timer = null; }
+      stopped = true;
+      if (timer) { clearTimeout(timer); timer = null; }
     }
   });
 
