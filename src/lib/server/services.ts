@@ -1,220 +1,258 @@
-// src/lib/server/services.ts
-// Minimal back-end fetchers for cards + "not configured" states.
+/* src/lib/server/services.ts
+   Card data fetchers for PlexStax (Sonarr, Radarr, SABnzbd, NZBGet, Overseerr, Tautulli).
+   - Uses a configurable timeout (HTTP_TIMEOUT_MS, default 25s)
+   - Uses lighter endpoints / pagination to get counts quickly
+   - Never throws: each card returns { state, data?, message? }
+*/
 
-type Ok<T> = { state: 'ok'; data: T };
-type NotConfigured = { state: 'not_configured' };
-type Err = { state: 'error'; message: string };
-export type CardResult<T> = Ok<T> | NotConfigured | Err;
+type State = 'ok' | 'not_configured' | 'error';
+type Card<T> = { state: State; data?: T; message?: string };
 
-const env = {
-  SONARR_URL: process.env.SONARR_URL || '',
-  SONARR_API_KEY: process.env.SONARR_API_KEY || '',
-  RADARR_URL: process.env.RADARR_URL || '',
-  RADARR_API_KEY: process.env.RADARR_API_KEY || '',
-  SABNZBD_URL: process.env.SABNZBD_URL || '',
-  SABNZBD_API_KEY: process.env.SABNZBD_API_KEY || '',
-  NZBGET_URL: process.env.NZBGET_URL || '',
-  NZBGET_USER: process.env.NZBGET_USER || '',
-  NZBGET_PASS: process.env.NZBGET_PASS || '',
-  OVERSEERR_URL: process.env.OVERSEERR_URL || '',
-  OVERSEERR_API_KEY: process.env.OVERSEERR_API_KEY || '',
-  TAUTULLI_URL: process.env.TAUTULLI_URL || '',
-  TAUTULLI_API_KEY: process.env.TAUTULLI_API_KEY || '',
+const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 25000); // 25s default
+
+// ---- env helpers (tolerate common misspellings) ----
+function envOne(...names: string[]) {
+  for (const n of names) {
+    const v = process.env[n];
+    if (typeof v === 'string' && v.trim() !== '') return v.trim();
+  }
+  return '';
+}
+
+const ENV = {
+  SONARR_URL: envOne('SONARR_URL'),
+  SONARR_KEY: envOne('SONARR_API_KEY'),
+  RADARR_URL: envOne('RADARR_URL'),
+  RADARR_KEY: envOne('RADARR_API_KEY'),
+  SAB_URL: envOne('SABNZBD_URL'),
+  SAB_KEY: envOne('SABNZBD_API_KEY'),
+  NZBGET_URL: envOne('NZBGET_URL'),
+  NZBGET_USER: envOne('NZBGET_USER'),
+  NZBGET_PASS: envOne('NZBGET_PASS'),
+  OVERSEERR_URL: envOne('OVERSEERR_URL', 'OVERSEER_URL'),
+  OVERSEERR_KEY: envOne('OVERSEERR_API_KEY', 'OVERSEER_API_KEY'),
+  TAUTULLI_URL: envOne('TAUTULLI_URL'),
+  TAUTULLI_KEY: envOne('TAUTULLI_API_KEY')
 };
 
+// ---- utils ----
 function normalizeUrl(u: string): string {
   if (!u) return '';
-  if (u.startsWith('http://') || u.startsWith('https://')) return u;
-  return `http://${u}`;
+  // allow "host:port"
+  if (/^[^:/]+\:\d+$/.test(u)) return `http://${u}`;
+  // fix common typos http//host or http///host
+  u = u.replace(/^http\/\/\//i, 'http://').replace(/^http\/\//i, 'http://');
+  if (!/^https?:\/\//i.test(u)) u = `http://${u}`;
+  return u.replace(/\/+$/,''); // trim trailing slash
 }
 
-async function fetchJson<T>(
-  url: string,
-  init: RequestInit = {},
-  timeoutMs = 8000
-): Promise<T> {
+async function fetchJson<T>(url: string, init: RequestInit = {}, timeoutMs = HTTP_TIMEOUT_MS): Promise<T> {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...init, signal: ctrl.signal });
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error(`HTTP ${res.status} ${res.statusText}${txt ? ` — ${txt.slice(0,120)}`:''}`);
+    }
     return (await res.json()) as T;
   } finally {
-    clearTimeout(t);
+    clearTimeout(to);
   }
 }
 
-/* -------------------- Sonarr -------------------- */
-type SonarrQueue = any[] | { records?: any[]; totalRecords?: number };
-type SonarrSeries = any[];
+function ok<T>(data: T): Card<T> { return { state: 'ok', data }; }
+function notConfigured<T = any>(msg?: string): Card<T> { return { state: 'not_configured', message: msg }; }
+function toErr<T = any>(e: unknown): Card<T> {
+  const m = e instanceof Error
+    ? (/abort/i.test(e.message) ? 'Timed out (increase HTTP_TIMEOUT_MS or check URL/network)' : e.message)
+    : String(e);
+  return { state: 'error', message: m };
+}
 
-export async function sonarrCard(): Promise<CardResult<{
-  queued: number; wanted: number; series: number; link: string;
-}>> {
-  const url = normalizeUrl(env.SONARR_URL);
-  const key = env.SONARR_API_KEY;
-  if (!url || !key) return { state: 'not_configured' };
-  const h = { 'X-Api-Key': key };
+// ---------------- Sonarr ----------------
+export async function sonarrCard(): Promise<Card<{ queued: number; wanted: number; series: number; link: string }>> {
+  const base = normalizeUrl(ENV.SONARR_URL);
+  const key = ENV.SONARR_KEY;
+  if (!base || !key) return notConfigured('Set SONARR_URL and SONARR_API_KEY');
+
+  const headers = { 'X-Api-Key': key };
 
   try {
-    const [queue, series, wanted] = await Promise.all([
-      fetchJson<SonarrQueue>(`${url}/api/v3/queue`, { headers: h }),
-      fetchJson<SonarrSeries>(`${url}/api/v3/series`, { headers: h }),
-      // wanted/missing supports paging; we only need totalRecords
-      fetchJson<{ totalRecords?: number }>(`${url}/api/v3/wanted/missing?page=1&pageSize=1`, { headers: h })
+    // quick liveness check
+    await fetchJson(`${base}/api/v3/system/status`, { headers }, 8000);
+
+    // use pagination to get counts quickly
+    const [queue, wanted, series] = await Promise.all([
+      fetchJson<any>(`${base}/api/v3/queue?page=1&pageSize=1`, { headers }, 12000),
+      fetchJson<any>(`${base}/api/v3/wanted/missing?page=1&pageSize=1`, { headers }, 12000),
+      // series list can be heavy; some builds support totalRecords via paging
+      fetchJson<any>(`${base}/api/v3/series?page=1&pageSize=1&includeStatistics=false`, { headers }, 15000)
     ]);
 
-    const queued =
-      Array.isArray(queue) ? queue.length :
-      (Array.isArray(queue.records) ? queue.records.length : (queue.totalRecords ?? 0));
+    const queued = typeof queue?.totalRecords === 'number'
+      ? queue.totalRecords
+      : Array.isArray(queue?.records) ? queue.records.length
+      : Array.isArray(queue) ? queue.length : 0;
 
-    return { state: 'ok', data: {
-      queued, wanted: wanted.totalRecords ?? 0, series: Array.isArray(series) ? series.length : 0, link: url
-    }};
-  } catch (e: any) {
-    return { state: 'error', message: String(e?.message || e) };
+    const wantedCount = typeof wanted?.totalRecords === 'number'
+      ? wanted.totalRecords
+      : Array.isArray(wanted?.records) ? wanted.records.length
+      : 0;
+
+    const seriesCount = typeof series?.totalRecords === 'number'
+      ? series.totalRecords
+      : Array.isArray(series) ? series.length
+      : 0;
+
+    return ok({ queued, wanted: wantedCount, series: seriesCount, link: base });
+  } catch (e) {
+    return toErr(e);
   }
 }
 
-/* -------------------- Radarr -------------------- */
-export async function radarrCard(): Promise<CardResult<{
-  queued: number; movies: number; link: string;
-}>> {
-  const url = normalizeUrl(env.RADARR_URL);
-  const key = env.RADARR_API_KEY;
-  if (!url || !key) return { state: 'not_configured' };
-  const h = { 'X-Api-Key': key };
+// ---------------- Radarr ----------------
+export async function radarrCard(): Promise<Card<{ queued: number; movies: number; link: string }>> {
+  const base = normalizeUrl(ENV.RADARR_URL);
+  const key = ENV.RADARR_KEY;
+  if (!base || !key) return notConfigured('Set RADARR_URL and RADARR_API_KEY');
+
+  const headers = { 'X-Api-Key': key };
 
   try {
-    const [queue, movies] = await Promise.all([
-      fetchJson<any[] | { records?: any[]; totalRecords?: number }>(`${url}/api/v3/queue`, { headers: h }),
-      fetchJson<any[]>(`${url}/api/v3/movie`, { headers: h }),
+    await fetchJson(`${base}/api/v3/system/status`, { headers }, 8000);
+
+    const [queue] = await Promise.all([
+      fetchJson<any>(`${base}/api/v3/queue?page=1&pageSize=1`, { headers }, 12000)
     ]);
-    const queued =
-      Array.isArray(queue) ? queue.length :
-      (Array.isArray((queue as any).records) ? (queue as any).records.length : ((queue as any).totalRecords ?? 0));
 
-    return { state: 'ok', data: { queued, movies: Array.isArray(movies) ? movies.length : 0, link: url } };
-  } catch (e: any) {
-    return { state: 'error', message: String(e?.message || e) };
-  }
-}
-
-/* -------------------- SABnzbd -------------------- */
-export async function sabCard(): Promise<CardResult<{
-  queue: number; rateDownBps: number; link: string;
-}>> {
-  const url = normalizeUrl(env.SABNZBD_URL);
-  const key = env.SABNZBD_API_KEY;
-  if (!url || !key) return { state: 'not_configured' };
-
-  try {
-    const q = await fetchJson<{ queue?: any }>(`${url}/api?mode=queue&output=json&apikey=${encodeURIComponent(key)}`);
-    const queue = (q?.queue?.slots || []).length || 0;
-    const kbps = parseFloat(q?.queue?.kbpersec || '0'); // KB/s
-    const rateDownBps = isFinite(kbps) ? kbps * 1024 : 0;
-    return { state: 'ok', data: { queue, rateDownBps, link: url } };
-  } catch (e: any) {
-    return { state: 'error', message: String(e?.message || e) };
-  }
-}
-
-/* -------------------- NZBGet -------------------- */
-export async function nzbgetCard(): Promise<CardResult<{
-  queue: number; rateDownBps: number; link: string;
-}>> {
-  const url = normalizeUrl(env.NZBGET_URL);
-  if (!url) return { state: 'not_configured' };
-
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (env.NZBGET_USER || env.NZBGET_PASS) {
-    const token = Buffer.from(`${env.NZBGET_USER}:${env.NZBGET_PASS}`).toString('base64');
-    headers.Authorization = `Basic ${token}`;
-  }
-
-  try {
-    const status = await fetchJson<{ result?: { DownloadRate?: number } }>(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ method: 'status', params: [], id: 1 })
-    });
-    const groups = await fetchJson<{ result?: any[] }>(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ method: 'listgroups', params: [0], id: 2 })
-    });
-
-    const rateDownBps = status?.result?.DownloadRate ?? 0;
-    const queue = Array.isArray(groups?.result) ? groups.result.length : 0;
-
-    return { state: 'ok', data: { queue, rateDownBps, link: url.replace(/\/jsonrpc$/i, '') } };
-  } catch (e: any) {
-    return { state: 'error', message: String(e?.message || e) };
-  }
-}
-
-/* -------------------- Overseerr -------------------- */
-export async function overseerrCard(): Promise<CardResult<{
-  pending: number; available: number; link: string;
-}>> {
-  const url = normalizeUrl(env.OVERSEERR_URL);
-  const key = env.OVERSEERR_API_KEY;
-  if (!url || !key) return { state: 'not_configured' };
-  const h = { 'X-Api-Key': key };
-
-  // We just need totals; list 1 item and read pageInfo.total
-  async function count(filter: string): Promise<number> {
+    // movie count: try paged trick first (if unsupported, fall back to full list with larger timeout)
+    let moviesCount = 0;
     try {
-      const r = await fetchJson<{ pageInfo?: { total?: number } }>(
-        `${url}/api/v1/request?take=1&filter=${encodeURIComponent(filter)}`, { headers: h }
-      );
-      return r?.pageInfo?.total ?? 0;
-    } catch {
-      return 0;
+      const moviesPaged = await fetchJson<any>(`${base}/api/v3/movie?page=1&pageSize=1`, { headers }, 12000);
+      if (typeof moviesPaged?.totalRecords === 'number') moviesCount = moviesPaged.totalRecords;
+    } catch { /* ignore */ }
+
+    if (moviesCount === 0) {
+      // fallback (heavier)
+      const all = await fetchJson<any[]>(`${base}/api/v3/movie`, { headers }, HTTP_TIMEOUT_MS);
+      moviesCount = Array.isArray(all) ? all.length : Number(all?.length ?? 0);
     }
-  }
 
-  try {
-    const [pending, available] = await Promise.all([count('pending'), count('available')]);
-    return { state: 'ok', data: { pending, available, link: url } };
-  } catch (e: any) {
-    return { state: 'error', message: String(e?.message || e) };
+    const queued = typeof queue?.totalRecords === 'number'
+      ? queue.totalRecords
+      : Array.isArray(queue?.records) ? queue.records.length
+      : Array.isArray(queue) ? queue.length : 0;
+
+    return ok({ queued, movies: moviesCount, link: base });
+  } catch (e) {
+    return toErr(e);
   }
 }
 
-/* -------------------- Tautulli (preferred for Plex now playing) -------------------- */
-export async function tautulliCard(): Promise<CardResult<{
-  sessions: Array<{ user: string; title: string; progress: number; duration: number; position: number }>;
-  total: number; link: string;
-}>> {
-  const url = normalizeUrl(env.TAUTULLI_URL);
-  const key = env.TAUTULLI_API_KEY;
-  if (!url || !key) return { state: 'not_configured' };
+// ---------------- SABnzbd ----------------
+export async function sabCard(): Promise<Card<{ queue: number; rateDownBps: number; link: string }>> {
+  const base = normalizeUrl(ENV.SAB_URL);
+  const key = ENV.SAB_KEY;
+  if (!base || !key) return notConfigured('Set SABNZBD_URL and SABNZBD_API_KEY');
 
   try {
-    const r = await fetchJson<{ response?: { data?: { sessions?: any[]; stream_count?: number } } }>(
-      `${url}/api/v2?apikey=${encodeURIComponent(key)}&cmd=get_activity`
-    );
-    const data = r?.response?.data || {};
-    const sessions = (data.sessions || []).map((s: any) => ({
-      user: s.friendly_name || s.username || 'User',
-      title: s.full_title || s.title || 'Playing',
-      progress: typeof s.progress_percent === 'number' ? Math.max(0, Math.min(100, s.progress_percent)) : 0,
-      duration: Number(s.duration) || 0,
-      position: Number(s.view_offset) || 0
+    const q = await fetchJson<any>(`${base}/api?mode=queue&output=json&apikey=${encodeURIComponent(key)}`, {}, 10000);
+    const queueCount = Number(q?.queue?.noofslots ?? (Array.isArray(q?.queue?.slots) ? q.queue.slots.length : 0));
+    const rateDown = Number(q?.queue?.kbpersec ? q.queue.kbpersec * 1024 : 0);
+    return ok({ queue: queueCount, rateDownBps: rateDown, link: base });
+  } catch (e) {
+    return toErr(e);
+  }
+}
+
+// ---------------- NZBGet ----------------
+export async function nzbgetCard(): Promise<Card<{ queue: number; rateDownBps: number; link: string }>> {
+  let base = normalizeUrl(ENV.NZBGET_URL);
+  if (!base) return notConfigured('Set NZBGET_URL');
+
+  // JSON-RPC is at /jsonrpc; append if user gave host root
+  if (!/\/jsonrpc$/.test(base)) base = `${base}/jsonrpc`;
+
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (ENV.NZBGET_USER || ENV.NZBGET_PASS) {
+      headers['Authorization'] = 'Basic ' + Buffer.from(`${ENV.NZBGET_USER}:${ENV.NZBGET_PASS}`).toString('base64');
+    }
+    const res = await fetch(base, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ method: 'status', params: [], id: 1 }),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data: any = await res.json();
+    const s = data?.result || {};
+    const queue = Number(s?.QueuedCount ?? 0);
+    const rateDownBps = Number(s?.DownloadRate ?? 0);
+    return ok({ queue, rateDownBps, link: base.replace(/\/jsonrpc$/,'') });
+  } catch (e) {
+    return toErr(e);
+  }
+}
+
+// ---------------- Overseerr ----------------
+export async function overseerrCard(): Promise<Card<{ pending: number; available: number; link: string }>> {
+  const base = normalizeUrl(ENV.OVERSEERR_URL);
+  const key  = ENV.OVERSEERR_KEY;
+  if (!base || !key) return notConfigured('Set OVERSEERR_URL and OVERSEERR_API_KEY');
+
+  const headers = { 'X-Api-Key': key };
+
+  try {
+    // /status often includes request stats; if not, fall back to filtered calls
+    let pending = 0, available = 0;
+    try {
+      const st = await fetchJson<any>(`${base}/api/v1/status`, { headers }, 10000);
+      pending = Number(st?.requests?.pending ?? 0);
+      available = Number(st?.requests?.available ?? 0);
+    } catch {
+      // Fallback by filter (cheap: take=1 just to get totals)
+      try {
+        const p = await fetchJson<any>(`${base}/api/v1/request?take=1&skip=0&filter=pending`, { headers }, 10000);
+        pending = Number(p?.pageInfo?.results ?? p?.total ?? 0);
+      } catch {}
+      try {
+        const a = await fetchJson<any>(`${base}/api/v1/request?take=1&skip=0&filter=available`, { headers }, 10000);
+        available = Number(a?.pageInfo?.results ?? a?.total ?? 0);
+      } catch {}
+    }
+
+    return ok({ pending, available, link: base });
+  } catch (e) {
+    return toErr(e);
+  }
+}
+
+// ---------------- Tautulli (Plex) ----------------
+export async function tautulliCard(): Promise<Card<{ total: number; sessions: Array<{ user: string; progress: number }>; link: string }>> {
+  const base = normalizeUrl(ENV.TAUTULLI_URL);
+  const key  = ENV.TAUTULLI_KEY;
+  if (!base || !key) return notConfigured('Set TAUTULLI_URL and TAUTULLI_API_KEY');
+
+  try {
+    const d = await fetchJson<any>(`${base}/api/v2?apikey=${encodeURIComponent(key)}&cmd=get_activity`, {}, 12000);
+    const sess = Array.isArray(d?.response?.data?.sessions) ? d.response.data.sessions : [];
+    const mapped = sess.slice(0, 5).map((s: any) => ({
+      user: String(s?.friendly_name || s?.username || 'User'),
+      progress: Number(s?.progress_percent || 0)
     }));
-    const total = Number(data.stream_count) || sessions.length;
-    return { state: 'ok', data: { sessions, total, link: url } };
-  } catch (e: any) {
-    return { state: 'error', message: String(e?.message || e) };
+    const total = Number(d?.response?.data?.stream_count || mapped.length || 0);
+    return ok({ total, sessions: mapped, link: base });
+  } catch (e) {
+    return toErr(e);
   }
 }
 
-/* -------------------- Aggregate for SSE -------------------- */
+// ---------------- gatherCards ----------------
 export async function gatherCards() {
   const [sonarr, radarr, sab, nzbget, overseerr, tautulli] = await Promise.all([
     sonarrCard(), radarrCard(), sabCard(), nzbgetCard(), overseerrCard(), tautulliCard()
   ]);
-
   return { sonarr, radarr, sab, nzbget, overseerr, tautulli };
 }
