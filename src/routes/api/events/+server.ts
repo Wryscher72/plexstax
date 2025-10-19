@@ -2,41 +2,29 @@ import type { RequestHandler } from '@sveltejs/kit';
 import { gatherCards } from '$lib/server/services';
 
 export const GET: RequestHandler = ({ request }) => {
-  let timer: ReturnType<typeof setInterval> | null = null;
   const te = new TextEncoder();
+  let timer: ReturnType<typeof setInterval> | null = null;
 
-  const stream = new ReadableStream({
+  const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const send = (obj: any) => controller.enqueue(te.encode(`data: ${JSON.stringify(obj)}\n\n`));
       const ping = () => controller.enqueue(te.encode(`:hb ${Date.now()}\n\n`));
 
-      // initial hello
+      // hello + first payload
       send({ kind: 'hello' });
+      try { send({ kind: 'cards', data: await gatherCards() }); } catch {}
 
-      // first payload (don’t fail the stream if upstreams are down)
-      try {
-        send({ kind: 'cards', data: await gatherCards() });
-      } catch {
-        // ignore; next tick will try again
-      }
-
-      // steady updates
+      // periodic updates
       timer = setInterval(async () => {
-        try {
-          send({ kind: 'cards', data: await gatherCards() });
-        } catch {
-          // swallow; keep the stream alive
-        }
+        try { send({ kind: 'cards', data: await gatherCards() }); } catch {}
         ping();
       }, 5000);
 
-      // cleanup on client disconnect; do NOT close() here (Response will handle it)
+      // cleanup on disconnect
       request.signal.addEventListener('abort', () => {
         if (timer) { clearInterval(timer); timer = null; }
       });
     },
-
-    // also handle consumer cancel (e.g., client navigates away)
     cancel() {
       if (timer) { clearInterval(timer); timer = null; }
     }
